@@ -429,10 +429,23 @@ class AppModule(appModuleHandler.AppModule):
 		else: message(_("Nothing is playing right now"))
 
 	# Audio player close function
+	def get_audio_player_close_button(self):
+		# Current Unigram has no ShuffleButton to anchor on, and its close button has
+		# no automation id and a localized name, so it is found by its icon. The
+		# PlaybackButton must be present, so no other close button can be picked
+		# while no player is open.
+		elements = self.getElements()
+		if not next((item for item in elements if item.UIAAutomationId == "PlaybackButton"), None): return False
+		for item in elements:
+			try:
+				if item.role == Role.BUTTON and not item.UIAAutomationId and item.firstChild and item.firstChild.name == icons_in_audio_player["close"]:
+					return item
+			except: pass
+		return False
+
 	@script(description=_("Close audio player"), gesture="kb:ALT+E")
 	def script_closingVoiceMessage(self, gesture, isMessage = True):
-		try: targetButton = next((item for item in self.getElements()[1:] if item.previous.role == Role.TOGGLEBUTTON and item.previous.UIAAutomationId == "ShuffleButton"), False)
-		except: targetButton = False
+		targetButton = self.get_audio_player_close_button()
 		if targetButton:
 			lastFocus = api.getFocusObject()
 			targetButton.doAction()
@@ -854,7 +867,10 @@ class AppModule(appModuleHandler.AppModule):
 		if obj.next and obj.next.UIAAutomationId == "ElapsedLabel":
 			log.debug("Second press of the record voice message button")
 			if conf.get("voiceMessageRecordingIndicator") == "audio":
-				winsound.PlaySound(baseDir+"send_voice_message.wav", winsound.SND_ASYNC | winsound.SND_NOSTOP)
+				# SND_NOSTOP fails while another sound is still playing, which aborted this
+				# script before the record button was pressed, so the voice was not sent.
+				try: winsound.PlaySound(baseDir+"send_voice_message.wav", winsound.SND_ASYNC | winsound.SND_NOSTOP)
+				except RuntimeError: winsound.PlaySound(baseDir+"send_voice_message.wav", winsound.SND_ASYNC)
 				# Timer(.1, winsound.PlaySound, (baseDir+"send_voice_message.wav", winsound.SND_ASYNC | winsound.SND_NOSTOP)).start()
 			else:
 				message(_("Record sent"))
@@ -884,6 +900,25 @@ class AppModule(appModuleHandler.AppModule):
 			obj.doAction()
 			lastFocus.setFocus()
 
+	def send_cancel_recording_key(self, announcement=None):
+		# Unigram checks Ctrl with GetAsyncKeyState at the moment it handles the D key.
+		# NVDA's send() presses and releases Ctrl around D in one go, so Unigram often
+		# found Ctrl already up and ignored the key. Keep Ctrl down while it reads it.
+		if winUser.getAsyncKeyState(winUser.VK_CONTROL) & 32768:
+			# The user is still holding Ctrl: send D alone and leave Ctrl as it is
+			KeyboardInputGesture.fromName("d").send()
+			if announcement: message(announcement)
+			return
+		# Ctrl was already released, so hold it until Unigram has handled the key.
+		# Releasing Ctrl stops NVDA's speech, so the announcement comes afterwards.
+		import core
+		winUser.keybd_event(winUser.VK_CONTROL, 0, 0, 0)
+		KeyboardInputGesture.fromName("d").send()
+		def releaseControl():
+			winUser.keybd_event(winUser.VK_CONTROL, 0, winUser.KEYEVENTF_KEYUP, 0)
+			if announcement: message(announcement)
+		core.callLater(400, releaseControl)
+
 	# Voice message discard function
 	# @script(gesture="kb:control+D")
 	def script_cancelVoiceMessageRecording(self, gesture):
@@ -909,8 +944,21 @@ class AppModule(appModuleHandler.AppModule):
 			if obj.previous.name == "\uea4a": message(_("Reply canceled"))
 			else: message(_("Edit canceled"))
 		elif obj and obj.UIAAutomationId == "ElapsedLabel":
-			if conf.get("voiceMessageRecordingIndicator") == "audio": winsound.PlaySound(baseDir+"cancel_voice_message_recording.wav", winsound.SND_ASYNC | winsound.SND_NOSTOP)
-			else: message(_("Recording canceled"))
+			if conf.get("voiceMessageRecordingIndicator") == "audio":
+				# SND_NOSTOP fails while another sound is still playing. The error used to
+				# abort this script before Ctrl+D was sent, so the recording was not canceled.
+				try: winsound.PlaySound(baseDir+"cancel_voice_message_recording.wav", winsound.SND_ASYNC | winsound.SND_NOSTOP)
+				except RuntimeError: winsound.PlaySound(baseDir+"cancel_voice_message_recording.wav", winsound.SND_ASYNC)
+			# The focus is already in the message field here. Setting it again right
+			# after sending Ctrl+D raced the keystroke, so a press sometimes did not
+			# cancel. Let Unigram handle the key first, then put the focus back only
+			# if the cancellation moved it.
+			self.send_cancel_recording_key(None if conf.get("voiceMessageRecordingIndicator") == "audio" else _("Recording canceled"))
+			def restoreFocus():
+				if api.getFocusObject() != lastFocus: lastFocus.setFocus()
+			import core
+			core.callLater(300, restoreFocus)
+			return
 		gesture.send()
 		lastFocus.setFocus()
 		lastFocus.setFocus()
@@ -1187,7 +1235,8 @@ class AppModule(appModuleHandler.AppModule):
 				clsList.insert(0, Audio_and_video_button)
 			# elif obj.role == Role.BUTTON and obj.UIAAutomationId == "Explanation":
 				# clsList.insert(0, ExplanationCorrectAnswerInQuiz)
-			elif obj.role == Role.SLIDER and obj.UIAAutomationId == "Slider":
+			# Current Unigram exposes the Seek slider as a custom control, not a slider
+			elif obj.UIAAutomationId == "Slider" and (obj.role == Role.SLIDER or obj.name == "Seek"):
 				self.saved_items.save("slider", obj)
 			elif conf.get("voicingPerformanceIndicators") == "none" and obj.role == Role.PROGRESSBAR:
 				clsList.pop(0)
@@ -1335,19 +1384,37 @@ class AppModule(appModuleHandler.AppModule):
 		message(text_message)
 
 
-	def rewind_voice_message(self, direction):
+	def get_playback_slider(self):
 		slider = self.saved_items.get("slider")
-		if not slider or slider.location.width == 0:
+		if slider and slider.location and slider.location.width: return slider
+		# The slider is only saved when NVDA has created it, which may never happen
+		slider = next((item for item in self.getElements() if item.UIAAutomationId == "Slider" and (item.role == Role.SLIDER or item.name == "Seek")), None)
+		if slider and slider.location and slider.location.width:
+			self.saved_items.save("slider", slider)
+			return slider
+		return False
+
+	def send_key_without_held_modifiers(self, key_name):
+		# NVDA's send() only presses the modifiers of the gesture itself. The Ctrl and
+		# Alt the user is still holding stay down, so Unigram received Ctrl+Alt+Arrow
+		# and ignored it. Lift them around the key and press them back afterwards.
+		held = [code for code in (winUser.VK_CONTROL, winUser.VK_MENU, winUser.VK_SHIFT, winUser.VK_LWIN, winUser.VK_RWIN) if winUser.getAsyncKeyState(code) & 32768]
+		for code in held: winUser.keybd_event(code, 0, winUser.KEYEVENTF_KEYUP, 0)
+		try: KeyboardInputGesture.fromName(key_name).send()
+		finally:
+			# Press back exactly what was lifted, or the shortcut stops repeating while held
+			for code in held: winUser.keybd_event(code, 0, 0, 0)
+
+	def rewind_voice_message(self, direction):
+		slider = self.get_playback_slider()
+		if not slider:
 			message(_("Nothing is playing right now"))
 			return False
-		self.script_pauseVoiceMessage(None)
 		obj = api.getFocusObject()
 		slider.setFocus()
-		KeyboardInputGesture.fromName(direction).send()
-		self.script_pauseVoiceMessage(None)
+		self.send_key_without_held_modifiers(direction)
 		obj.setFocus()
 		speech.cancelSpeech()
-		obj.setFocus()
 
 	def script_rewind_voice_message(self, gesture):
 		try: index = int(gesture.mainKeyName[-1])
